@@ -1,122 +1,131 @@
 import streamlit as st
-import fitz  # PyMuPDF
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
+import fitz
 import io
-import re
 import asyncio
 import httpx
-import time
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+import re
 
-st.set_page_config(page_title="QnAfy: PDF Q&A with AI", layout="centered")
-st.title("📄 QnAfy – AI-powered PDF Question Answering")
+st.set_page_config(page_title="QnAfy AI Extractor", layout="wide")
+st.title("📄 QnAfy Pro – AI-Based Question Answering")
 
-# --- CONFIG ---
 OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = "mistralai/mistral-7b-instruct"  # Free and fast
+OPENROUTER_MODEL = "mistralai/mistral-7b-instruct"
 
-# --- UI: Upload + Reset ---
-uploaded_file = st.file_uploader("📤 Upload a PDF containing questions", type=["pdf"])
-if st.button("🔁 Reset / Upload New PDF"):
-    st.session_state.clear()
-    st.rerun()
+# 🧠 Use AI to extract technical questions from raw text
+async def extract_questions_with_ai(text, client):
+    prompt = f"""Extract all distinct technical interview questions from the following raw PDF content.
+Return only a numbered list of actual questions. Ignore section headers, context text, and answers.
 
-
-# --- Clean Text & Extract Questions ---
-def fix_text_and_extract_questions(text):
-    # Fix camelCase and broken joint words
-    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
-    text = re.sub(r"(?<=\w)([&])(?=\w)", " & ", text)
-
-    # Normalize and merge lines
-    lines = text.replace('\r', '').split('\n')
-    merged = ' '.join([line.strip() for line in lines if line.strip()])
-
-    # Extract questions ending with '?'
-    raw_questions = [q.strip() + '?' for q in merged.split('?') if len(q.strip()) > 5]
-    return raw_questions
-
-
-# --- Async OpenRouter QnA ---
-async def get_answer_async(question, client):
+Text:
+{text}"""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
     data = {
         "model": OPENROUTER_MODEL,
-        "messages": [{"role": "user", "content": f"Answer this question:\n\n{question}"}]
+        "messages": [{"role": "user", "content": prompt}]
     }
+    response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=data, headers=headers)
+    response.raise_for_status()
+    result = response.json()["choices"][0]["message"]["content"]
+    return re.findall(r'\d+\.\s*(.+)', result)
 
-    try:
-        response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=data, headers=headers)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return f"[Error: {e}]"
+# 🎯 Build answer prompt
+def build_prompt(question, style="Concise"):
+    style_map = {
+        "Concise": "Answer this question briefly:",
+        "Detailed": "Explain this in detail:",
+        "Step-by-step": "Solve step-by-step:"
+    }
+    return f"{style_map.get(style)}\n\n{question}"
 
-async def answer_questions_async(questions):
-    results = []
-    progress = st.progress(0, "⏳ Answering...")
+# 🧠 Ask AI to answer a single question
+async def get_answer_async(question, client, style="Concise", retries=2):
+    if len(question) < 10:
+        return "[Skipped: Too short or unclear]"
+    prompt = build_prompt(question, style)
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    for attempt in range(retries + 1):
+        try:
+            response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=data, headers=headers)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"].strip()
+        except httpx.RequestError as e:
+            if attempt == retries:
+                return f"[Error: {e}]"
+            await asyncio.sleep(2 * (attempt + 1))
+
+# 🔁 Get answers in order
+async def answer_questions_async(questions, style):
     async with httpx.AsyncClient(timeout=60.0) as client:
-        tasks = [get_answer_async(q, client) for q in questions]
-        total = len(tasks)
-        for i, coro in enumerate(asyncio.as_completed(tasks)):
-            a = await coro
-            results.append(a)
-            progress.progress((i + 1) / total, f"Answered {i+1}/{total}")
-    return results
+        tasks = [get_answer_async(q, client, style=style) for q in questions]
+        return await asyncio.gather(*tasks)  # preserves order
 
+# 📤 PDF Upload
+uploaded_file = st.file_uploader("📤 Upload your PDF", type=["pdf"])
+style_choice = st.selectbox("🎯 Answer Style", ["Concise", "Detailed", "Step-by-step"])
 
-# --- Main Logic ---
-if uploaded_file:
-    if "last_filename" not in st.session_state or st.session_state.last_filename != uploaded_file.name:
-        st.session_state.last_filename = uploaded_file.name
-        st.session_state.qna_done = False
-        st.session_state.all_qna = []
+# 🧠 AI Question Extraction
+if uploaded_file and "ai_questions" not in st.session_state:
+    pdf_bytes = uploaded_file.read()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    full_text = "\n".join([page.get_text() for page in doc])
+    st.info("🧠 Extracting questions using AI...")
 
-        st.info("📖 Reading your PDF...")
-        pdf_reader = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-        all_questions = []
+    async def run_extraction(text):
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            return await extract_questions_with_ai(text, client)
 
-        for page_num, page in enumerate(pdf_reader, start=1):
-            raw_text = page.get_text()
-            questions = fix_text_and_extract_questions(raw_text)
-            if questions:
-                st.markdown(f"- Page {page_num}: found `{len(questions)}` question(s)")
-                all_questions.extend(questions)
+    st.session_state.ai_questions = asyncio.run(run_extraction(full_text))
+    st.rerun()
 
-        if not all_questions:
-            st.warning("❌ No valid questions found in this PDF.")
-        else:
-            est_time = len(all_questions) * 3
-            st.caption(f"🕒 Estimated time: ~{est_time} seconds for {len(all_questions)} question(s)")
+# 📝 Show extracted questions
+if "ai_questions" in st.session_state:
+    questions = st.session_state.ai_questions
+    st.subheader("✅ AI-Extracted Questions")
+    for i, q in enumerate(questions):
+        st.markdown(f"**Q{i+1}:** {q}")
 
-            answers = asyncio.run(answer_questions_async(all_questions))
-            st.session_state.all_qna = list(zip(all_questions, answers))
-            st.session_state.qna_done = True
-            st.success("✅ All questions answered! You can now download the final PDF.")
+    if st.button("🚀 Generate Answers"):
+        answers = asyncio.run(answer_questions_async(questions, style_choice))
+        st.session_state.qa = list(zip(questions, answers))
+        st.rerun()
 
-    all_qna = st.session_state.all_qna
+# ✅ Show answer previews
+if "qa" in st.session_state and st.session_state.qa:
+    st.success("✅ Answers generated.")
+    st.subheader("📋 Preview Q&A")
+    for i, (q, a) in enumerate(st.session_state.qa):
+        with st.expander(f"Q{i+1}"):
+            st.markdown(f"**Q:** {q}")
+            st.markdown(f"**A:** {a}")
 
-    # Generate and serve PDF
-    if st.session_state.qna_done:
-        output = io.BytesIO()
-        pdf = canvas.Canvas(output, pagesize=letter)
-        width, height = letter
-        y = height - 50
+    # 📄 Export as PDF
+    output = io.BytesIO()
+    pdf = canvas.Canvas(output, pagesize=letter)
+    width, height = letter
+    y = height - 50
 
-        for q, a in all_qna:
-            for line in [f"Q: {q}", f"A: {a}"]:
-                for subline in line.split('\n'):
-                    pdf.drawString(50, y, subline)
-                    y -= 15
-                    if y < 100:
-                        pdf.showPage()
-                        y = height - 50
-            y -= 20
+    for i, (q, a) in enumerate(st.session_state.qa):
+        for line in [f"Q{i+1}: {q}", f"A: {a}"]:
+            for subline in line.split('\n'):
+                pdf.drawString(50, y, subline)
+                y -= 15
+                if y < 100:
+                    pdf.showPage()
+                    y = height - 50
+        y -= 20
 
-        pdf.save()
-        output.seek(0)
-
-        st.download_button("📥 Download Answered PDF", output, file_name="Answered_PDF.pdf", mime="application/pdf")
+    pdf.save()
+    output.seek(0)
+    st.download_button("📥 Download Q&A PDF", output, file_name="QnAfy_Final_Answers.pdf", mime="application/pdf")
